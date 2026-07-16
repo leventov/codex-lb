@@ -73,6 +73,7 @@ from app.modules.proxy.load_balancer import (
     AccountSelection,
     RuntimeState,
     SelectionInputs,
+    StickyRebind,
     _filter_accounts_for_model,
     _mapped_model_has_registry_entry,
 )
@@ -8661,6 +8662,7 @@ def test_sticky_key_for_compact_request_prefers_codex_session_affinity():
     assert policy.key == "codex-session-1"
     assert policy.kind == proxy_service.StickySessionKind.CODEX_SESSION
     assert policy.reallocate_sticky is False
+    assert policy.reallocate_sticky_on_account_cap is True
     assert policy.max_age_seconds is None
 
 
@@ -8692,7 +8694,111 @@ def test_sticky_key_for_compact_request_prefers_turn_state_over_session_and_cach
     assert policy.key == "turn-owner"
     assert policy.kind == proxy_service.StickySessionKind.CODEX_SESSION
     assert policy.reallocate_sticky is False
+    assert policy.reallocate_sticky_on_account_cap is False
     assert policy.max_age_seconds is None
+
+
+def test_sticky_key_for_responses_request_keeps_client_turn_state_cap_bound() -> None:
+    payload = ResponsesRequest.model_validate(
+        {"model": "gpt-5.6-sol", "instructions": "hi", "input": [], "stream": True}
+    )
+
+    policy = proxy_service._sticky_key_for_responses_request(
+        payload,
+        headers={"x-codex-turn-state": "turn-owner", "session_id": "session-owner"},
+        codex_session_affinity=True,
+        openai_cache_affinity=False,
+        openai_cache_affinity_max_age_seconds=300,
+        sticky_threads_enabled=False,
+    )
+
+    assert policy.key == "turn-owner"
+    assert policy.kind == proxy_service.StickySessionKind.CODEX_SESSION
+    assert policy.reallocate_sticky_on_account_cap is False
+
+
+@pytest.mark.parametrize("request_type", [ResponsesRequest, ResponsesCompactRequest])
+@pytest.mark.parametrize(
+    "owner_payload",
+    [
+        {"conversation": "conv-owner"},
+        {"previous_response_id": "resp-owner-lookup-miss"},
+        {"input": [{"type": "input_file", "file_id": "file-owner"}]},
+    ],
+)
+def test_bare_session_cap_mobility_is_revoked_by_account_scoped_payload(
+    request_type: type[ResponsesRequest] | type[ResponsesCompactRequest],
+    owner_payload: dict[str, object],
+) -> None:
+    payload_data: dict[str, object] = {
+        "model": "gpt-5.6-sol",
+        "instructions": "hi",
+        "input": [],
+        **owner_payload,
+    }
+    payload = request_type.model_validate(payload_data)
+
+    if isinstance(payload, ResponsesRequest):
+        policy = proxy_service._sticky_key_for_responses_request(
+            payload,
+            headers={"session_id": "session-owner"},
+            codex_session_affinity=True,
+            openai_cache_affinity=False,
+            openai_cache_affinity_max_age_seconds=300,
+            sticky_threads_enabled=False,
+        )
+    else:
+        policy = proxy_service._sticky_key_for_compact_request(
+            payload,
+            headers={"session_id": "session-owner"},
+            codex_session_affinity=True,
+            openai_cache_affinity=False,
+            openai_cache_affinity_max_age_seconds=300,
+            sticky_threads_enabled=False,
+        )
+
+    assert policy.kind == proxy_service.StickySessionKind.CODEX_SESSION
+    assert policy.reallocate_sticky_on_account_cap is False
+    assert policy.require_unambiguous_account is ("conversation" in owner_payload)
+
+
+def test_compact_bare_session_cap_mobility_rejects_opaque_conversation_shape() -> None:
+    payload = ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "hi",
+            "input": [],
+            "conversation": {"id": "conv-owner"},
+        }
+    )
+
+    policy = proxy_service._sticky_key_for_compact_request(
+        payload,
+        headers={"session_id": "session-owner"},
+        codex_session_affinity=True,
+        openai_cache_affinity=False,
+        openai_cache_affinity_max_age_seconds=300,
+        sticky_threads_enabled=False,
+    )
+
+    assert policy.reallocate_sticky_on_account_cap is False
+
+
+def test_codex_session_selection_keys_are_namespaced_by_source() -> None:
+    session_policy = proxy_service._AffinityPolicy(
+        key="same-raw-value",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        codex_session_source="session_header",
+    )
+    turn_state_policy = proxy_service._AffinityPolicy(
+        key="same-raw-value",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        codex_session_source="turn_state",
+    )
+
+    assert session_policy.selection_key != turn_state_policy.selection_key
+    assert turn_state_policy.selection_key == "same-raw-value"
+    assert "same-raw-value" not in cast(str, session_policy.selection_key)
 
 
 def test_sticky_key_from_session_header_accepts_aliases_in_priority_order():
@@ -8770,6 +8876,7 @@ def test_sticky_key_for_responses_request_prefers_session_over_current_handshake
 
     assert policy.key == "session-owner"
     assert policy.kind == proxy_service.StickySessionKind.CODEX_SESSION
+    assert policy.reallocate_sticky_on_account_cap is True
 
 
 def test_sticky_key_for_responses_request_derives_prompt_cache_before_codex_session_return():
@@ -8793,6 +8900,7 @@ def test_sticky_key_for_responses_request_derives_prompt_cache_before_codex_sess
 
     assert policy.key == "codex-session-1"
     assert policy.kind == proxy_service.StickySessionKind.CODEX_SESSION
+    assert policy.reallocate_sticky_on_account_cap is True
     assert isinstance(payload.prompt_cache_key, str)
     assert payload.prompt_cache_key
 
@@ -8817,6 +8925,7 @@ def test_sticky_key_for_compact_request_derives_prompt_cache_before_codex_sessio
 
     assert policy.key == "codex-session-1"
     assert policy.kind == proxy_service.StickySessionKind.CODEX_SESSION
+    assert policy.reallocate_sticky_on_account_cap is True
     assert isinstance(payload.prompt_cache_key, str)
     assert payload.prompt_cache_key
 
@@ -9396,6 +9505,58 @@ async def test_stream_once_records_top_level_raw_codex_error_first(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_once_does_not_settle_rebind_when_response_create_cap_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account("acc_stream_rebind_cap")
+    settlement = proxy_service._StreamSettlement()
+    rebind = StickyRebind(
+        key="namespaced-sticky-key",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        expected_account_id="acc-old-owner",
+        selected_account_id=account.id,
+    )
+    settle_rebind = AsyncMock()
+    monkeypatch.setattr(service._load_balancer, "settle_sticky_rebind", settle_rebind)
+    monkeypatch.setattr(service, "_resolve_upstream_route_for_account", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        service,
+        "_acquire_account_response_create_lease_or_overload",
+        AsyncMock(
+            side_effect=proxy_module.ProxyResponseError(
+                429,
+                proxy_module.openai_error(
+                    "account_response_create_cap",
+                    "Account response-create concurrency limit reached",
+                ),
+            )
+        ),
+    )
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "hi", "input": [], "stream": True})
+
+    with pytest.raises(proxy_module.ProxyResponseError):
+        async for _ in service._stream_once(
+            account,
+            payload,
+            {},
+            "req_stream_rebind_cap",
+            False,
+            request_started_at=time.monotonic(),
+            api_key=None,
+            api_key_reservation=None,
+            settlement=settlement,
+            suppress_text_done_events=False,
+            upstream_stream_transport=None,
+            request_transport="http",
+            sticky_rebind=rebind,
+        ):
+            pass
+
+    settle_rebind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stream_once_penalizes_upstream_eof_after_visible_event(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -9679,14 +9840,11 @@ async def test_service_stream_responses_does_not_infer_previous_response_id_from
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     account = _make_account("acc_stream_no_session_infer")
     captured: dict[str, str | None] = {}
+    select_account = AsyncMock(return_value=AccountSelection(account=account, error_message=None))
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
-    monkeypatch.setattr(
-        service._load_balancer,
-        "select_account",
-        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
-    )
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
 
@@ -9702,15 +9860,26 @@ async def test_service_stream_responses_does_not_infer_previous_response_id_from
             "model": "gpt-5.4",
             "instructions": "hi",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+            "conversation": "conv-stream-scope",
             "stream": True,
         }
     )
 
-    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "turn_stream_scope"})]
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            payload,
+            {"session_id": "turn_stream_scope"},
+            codex_session_affinity=True,
+        )
+    ]
 
     assert chunks
     assert captured["previous_response_id"] is None
     assert request_logs.session_lookup_calls == []
+    assert select_account.await_args is not None
+    assert select_account.await_args.kwargs["reallocate_sticky_on_account_cap"] is False
+    assert select_account.await_args.kwargs["require_unambiguous_account"] is True
 
 
 @pytest.mark.asyncio
@@ -9719,14 +9888,11 @@ async def test_compact_responses_logs_service_tier_trace_and_generates_request_i
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
     account = _make_account("acc_trace_compact")
+    select_account = AsyncMock(return_value=AccountSelection(account=account, error_message=None))
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
-    monkeypatch.setattr(
-        service._load_balancer,
-        "select_account",
-        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
-    )
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     monkeypatch.setattr(service, "_settle_compact_api_key_usage", AsyncMock())
 
@@ -9740,6 +9906,7 @@ async def test_compact_responses_logs_service_tier_trace_and_generates_request_i
             "model": "gpt-5.1",
             "instructions": "summarize",
             "input": [],
+            "conversation": "conv-compact-trace",
             "service_tier": "priority",
         }
     )
@@ -9763,6 +9930,9 @@ async def test_compact_responses_logs_service_tier_trace_and_generates_request_i
     assert "requested_service_tier=priority" in caplog.text
     assert "actual_service_tier=default" in caplog.text
     assert request_logs.calls[0]["transport"] == "http"
+    assert select_account.await_args is not None
+    assert select_account.await_args.kwargs["reallocate_sticky_on_account_cap"] is False
+    assert select_account.await_args.kwargs["require_unambiguous_account"] is True
 
 
 @pytest.mark.asyncio
@@ -13380,6 +13550,13 @@ async def test_connect_proxy_websocket_passes_sticky_kind_to_load_balancer(monke
         reasoning_effort=None,
         api_key_reservation=None,
         started_at=0.0,
+        preferred_account_id=account.id,
+        replay_requires_preferred_account=True,
+        affinity_policy=proxy_service._AffinityPolicy(
+            key="codex-session-1",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+            reallocate_sticky_on_account_cap=True,
+        ),
     )
 
     websocket = cast(WebSocket, SimpleNamespace(send_text=AsyncMock()))
@@ -13403,6 +13580,8 @@ async def test_connect_proxy_websocket_passes_sticky_kind_to_load_balancer(monke
     assert await_args is not None
     assert await_args.kwargs["sticky_key"] == "codex-session-1"
     assert await_args.kwargs["sticky_kind"] == proxy_service.StickySessionKind.CODEX_SESSION
+    assert await_args.kwargs["reallocate_sticky_on_account_cap"] is False
+    assert await_args.kwargs["account_ids"] == {account.id}
 
 
 @pytest.mark.asyncio
@@ -14482,6 +14661,7 @@ async def test_select_websocket_connect_account_stream_cap_is_local_overload(mon
         reasoning_effort=None,
         api_key_reservation=None,
         started_at=0.0,
+        affinity_policy=proxy_service._AffinityPolicy(require_unambiguous_account=True),
     )
     select_account = AsyncMock(
         return_value=AccountSelection(
@@ -14517,6 +14697,7 @@ async def test_select_websocket_connect_account_stream_cap_is_local_overload(mon
     assert result is None
     assert select_account.await_args is not None
     assert select_account.await_args.kwargs["lease_kind"] == "stream"
+    assert select_account.await_args.kwargs["require_unambiguous_account"] is True
     await_args = websocket_send.await_args
     assert await_args is not None
     sent_payload = json.loads(await_args.args[0])
@@ -22156,6 +22337,12 @@ async def test_proxy_responses_websocket_releases_reservation_on_local_account_c
         started_at=10.0,
         request_text=request_text,
         awaiting_response_created=True,
+        sticky_rebind=StickyRebind(
+            key="namespaced-websocket-key",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+            expected_account_id="acc-ws-old-owner",
+            selected_account_id="acc_ws_account_cap",
+        ),
     )
     prepared_request = proxy_service._PreparedWebSocketRequest(
         text_data=request_text,
@@ -22191,6 +22378,8 @@ async def test_proxy_responses_websocket_releases_reservation_on_local_account_c
     )
     monkeypatch.setattr(service, "_release_websocket_reservation", release_reservation)
     monkeypatch.setattr(service, "_start_request_state_api_key_reservation_heartbeat", start_heartbeat)
+    settle_rebind = AsyncMock()
+    monkeypatch.setattr(service._load_balancer, "settle_sticky_rebind", settle_rebind)
 
     downstream = _FakeDownstreamWebSocket(request_text)
 
@@ -22210,6 +22399,115 @@ async def test_proxy_responses_websocket_releases_reservation_on_local_account_c
     payload = json.loads(downstream.sent_text[0])
     assert payload["type"] == "response.failed"
     assert payload["response"]["error"]["code"] == "account_response_create_cap"
+    settle_rebind.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_websocket_reroutes_bare_session_after_second_stage_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    settings = _make_proxy_settings()
+    settings.stream_idle_timeout_seconds = 300.0
+    settings.proxy_downstream_websocket_idle_timeout_seconds = 120.0
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.1",
+        "instructions": "",
+        "input": "self-contained",
+        "stream": True,
+    }
+    request_text = json.dumps(request_payload, separators=(",", ":"))
+    affinity = proxy_service._AffinityPolicy(
+        key="bare-session-reroute",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        reallocate_sticky_on_account_cap=True,
+        codex_session_source="session_header",
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-ws-cap-reroute",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        request_text=request_text,
+        affinity_policy=affinity,
+    )
+    prepared_request = proxy_service._PreparedWebSocketRequest(
+        text_data=request_text,
+        request_state=request_state,
+        affinity_policy=affinity,
+    )
+    owner = _make_account("acc-ws-create-capped")
+    alternate = _make_account("acc-ws-create-available")
+    owner_upstream = SimpleNamespace(send_text=AsyncMock(), send_bytes=AsyncMock(), close=AsyncMock())
+    alternate_upstream = SimpleNamespace(send_text=AsyncMock(), send_bytes=AsyncMock(), close=AsyncMock())
+    connect_states: list[tuple[str, set[str]]] = []
+
+    async def fake_connect(*args: object, **kwargs: object):
+        del args
+        state = cast(proxy_service._WebSocketRequestState, kwargs["request_state"])
+        connect_states.append((state.request_stage, set(state.excluded_account_ids)))
+        return (owner, owner_upstream) if len(connect_states) == 1 else (alternate, alternate_upstream)
+
+    acquire_calls = 0
+
+    async def acquire_response_create(*args: object, **kwargs: object) -> AccountLease:
+        nonlocal acquire_calls
+        del args, kwargs
+        acquire_calls += 1
+        if acquire_calls == 1:
+            raise proxy_module.ProxyResponseError(
+                429,
+                proxy_module.openai_error(
+                    "account_response_create_cap",
+                    "Account response-create concurrency limit reached",
+                ),
+            )
+        return AccountLease(
+            lease_id="lease-ws-create-available",
+            account_id=alternate.id,
+            kind="response_create",
+            acquired_at=time.monotonic(),
+        )
+
+    receive_calls = 0
+
+    async def receive() -> dict[str, object]:
+        nonlocal receive_calls
+        receive_calls += 1
+        if receive_calls == 1:
+            return {"type": "websocket.receive", "text": request_text}
+        return {"type": "websocket.disconnect"}
+
+    downstream = cast(
+        WebSocket,
+        SimpleNamespace(receive=receive, send_text=AsyncMock(), send_bytes=AsyncMock(), close=AsyncMock()),
+    )
+    monkeypatch.setattr(service, "_prepare_websocket_response_create_request", AsyncMock(return_value=prepared_request))
+    monkeypatch.setattr(service, "_connect_proxy_websocket", fake_connect)
+    monkeypatch.setattr(service, "_relay_upstream_websocket_messages", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_acquire_account_response_create_lease_or_overload", acquire_response_create)
+    monkeypatch.setattr(service, "_start_request_state_api_key_reservation_heartbeat", MagicMock())
+
+    await service.proxy_responses_websocket(
+        downstream,
+        {"session_id": "bare-session-reroute"},
+        codex_session_affinity=True,
+        openai_cache_affinity=False,
+        api_key=None,
+    )
+
+    assert connect_states == [("first_turn", set()), ("capacity_reroute", {owner.id})]
+    owner_upstream.send_text.assert_not_awaited()
+    alternate_upstream.send_text.assert_awaited_once()
+    assert request_state.request_stage == "reattach"
+    assert request_state.preferred_account_id == alternate.id
+    assert request_state.replay_requires_preferred_account is True
 
 
 @pytest.mark.asyncio
@@ -26117,7 +26415,14 @@ async def test_compact_responses_maps_inner_timeout_to_budget_timeout(monkeypatc
     monkeypatch.setattr(service, "_settle_compact_api_key_usage", AsyncMock(side_effect=settle_compact_api_key_usage))
     monkeypatch.setattr(proxy_service, "core_compact_responses", inner_timeout)
 
-    payload = ResponsesCompactRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": []})
+    payload = ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [],
+            "conversation": "conv-inner-timeout-owner",
+        }
+    )
 
     with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
         await service.compact_responses(payload, {"session_id": "sid-compact"}, codex_session_affinity=True)
@@ -26126,7 +26431,8 @@ async def test_compact_responses_maps_inner_timeout_to_budget_timeout(monkeypatc
     assert exc.status_code == 502
     assert _proxy_error_code(exc) == "upstream_request_timeout"
     assert call_order[:2] == ["settle_compact_api_key_usage", "handle_stream_error"]
-    sticky_sessions.delete.assert_awaited_once_with("sid-compact", kind=proxy_service.StickySessionKind.CODEX_SESSION)
+    sticky_sessions.delete_if_current.assert_not_awaited()
+    sticky_sessions.delete.assert_not_awaited()
     assert await service.drain_persistence_tasks(timeout_seconds=1)
     assert request_logs.calls[0]["status"] == "error"
     assert request_logs.calls[0]["account_id"] == account.id
@@ -26203,7 +26509,17 @@ async def test_compact_responses_surfaces_upstream_timeout_without_account_failo
     handle_stream_error_mock.assert_awaited_once()
     assert call_order[:2] == ["settle_compact_api_key_usage", "handle_stream_error"]
     record_errors.assert_not_awaited()
-    sticky_sessions.delete.assert_awaited_once_with("sid-compact", kind=proxy_service.StickySessionKind.CODEX_SESSION)
+    expected_selection_key = proxy_service._AffinityPolicy(
+        key="sid-compact",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        codex_session_source="session_header",
+    ).selection_key
+    sticky_sessions.delete_if_current.assert_awaited_once_with(
+        expected_selection_key,
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        expected_account_id=account_a.id,
+    )
+    sticky_sessions.delete.assert_not_awaited()
     assert await service.drain_persistence_tasks(timeout_seconds=1)
     assert request_logs.calls[0]["status"] == "error"
     assert request_logs.calls[0]["account_id"] == account_a.id
@@ -26385,11 +26701,26 @@ async def test_compact_responses_releases_account_create_lease_when_global_admis
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
     selected_lease = await service._load_balancer.acquire_account_lease(account.id, kind="response_create")
+    pending_rebind = StickyRebind(
+        key="namespaced-compact-key",
+        kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        expected_account_id="acc-compact-old-owner",
+        selected_account_id=account.id,
+    )
     monkeypatch.setattr(
         service._load_balancer,
         "select_account",
-        AsyncMock(return_value=AccountSelection(account=account, error_message=None, lease=selected_lease)),
+        AsyncMock(
+            return_value=AccountSelection(
+                account=account,
+                error_message=None,
+                lease=selected_lease,
+                sticky_rebind=pending_rebind,
+            )
+        ),
     )
+    settle_rebind = AsyncMock()
+    monkeypatch.setattr(service._load_balancer, "settle_sticky_rebind", settle_rebind)
     monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(return_value=account))
     upstream = AsyncMock()
     monkeypatch.setattr(proxy_service, "core_compact_responses", upstream)
@@ -26407,6 +26738,7 @@ async def test_compact_responses_releases_account_create_lease_when_global_admis
     assert _proxy_error_code(exc) == "global_admission_timeout"
     assert await service._load_balancer.account_pressure_snapshot(account.id) == (0, 0, 0.0)
     upstream.assert_not_awaited()
+    settle_rebind.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -26937,6 +27269,77 @@ async def test_select_account_with_budget_forwards_estimated_lease_tokens(monkey
     assert selection.account == account
     assert select_account.await_args is not None
     assert select_account.await_args.kwargs["estimated_lease_tokens"] == 1234.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_stage", "expected_cap_reallocation"),
+    [
+        ("first_turn", True),
+        ("follow_up", True),
+        ("capacity_reroute", True),
+        ("reattach", False),
+        ("bootstrap_rebind", False),
+    ],
+)
+async def test_select_account_with_budget_intersects_cap_mobility_with_request_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    request_stage: str,
+    expected_cap_reallocation: bool,
+) -> None:
+    settings = _make_proxy_settings()
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account(f"acc-cap-stage-{request_stage}")
+    select_account = AsyncMock(return_value=AccountSelection(account=account, error_message=None))
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(proxy_service, "_remaining_budget_seconds", lambda _deadline: 10.0)
+
+    await service._select_account_with_budget(
+        deadline=123.0,
+        request_id=f"req-cap-stage-{request_stage}",
+        kind="stream",
+        request_stage=request_stage,
+        sticky_key="bare-session",
+        sticky_kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        reallocate_sticky_on_account_cap=True,
+        lease_kind="stream",
+    )
+
+    assert select_account.await_args is not None
+    assert select_account.await_args.kwargs["reallocate_sticky_on_account_cap"] is expected_cap_reallocation
+
+
+@pytest.mark.asyncio
+async def test_select_account_with_budget_revokes_cap_mobility_for_preferred_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _make_proxy_settings()
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    owner = _make_account("acc-cap-preferred-owner")
+    select_account = AsyncMock(return_value=AccountSelection(account=owner, error_message=None))
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(proxy_service, "_remaining_budget_seconds", lambda _deadline: 10.0)
+
+    await service._select_account_with_budget(
+        deadline=123.0,
+        request_id="req-cap-preferred-owner",
+        kind="stream",
+        request_stage="first_turn",
+        sticky_key="bare-session",
+        sticky_kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        reallocate_sticky_on_account_cap=True,
+        preferred_account_id=owner.id,
+        lease_kind="stream",
+    )
+
+    assert select_account.await_count == 1
+    assert select_account.await_args is not None
+    assert select_account.await_args.kwargs["account_ids"] == {owner.id}
+    assert select_account.await_args.kwargs["reallocate_sticky_on_account_cap"] is False
 
 
 @pytest.mark.asyncio

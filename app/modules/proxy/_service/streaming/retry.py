@@ -64,7 +64,7 @@ from app.modules.proxy.helpers import (
     _parse_openai_error,
     _upstream_error_from_openai,
 )
-from app.modules.proxy.load_balancer import AccountLease, AccountSelection
+from app.modules.proxy.load_balancer import AccountLease, AccountSelection, StickyRebind
 
 _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
@@ -335,6 +335,7 @@ class _StreamingRetryMixin:
         excluded_account_ids: set[str] = set()
         deferred_capacity_account: Account | None = None
         deferred_capacity_lease: AccountLease | None = None
+        deferred_capacity_sticky_rebind: StickyRebind | None = None
         preferred_account_id: str | None = None
         file_preferred_account_id: str | None = rewritten_file_account_id
         require_preferred_account = False
@@ -440,6 +441,7 @@ class _StreamingRetryMixin:
             *,
             settlement: _StreamSettlement,
             can_try_other_account: bool,
+            sticky_rebind: StickyRebind | None,
             tool_call_dedupe: _WebSocketUpstreamControl,
         ) -> AsyncIterator[str]:
             nonlocal last_transient_exc
@@ -463,6 +465,7 @@ class _StreamingRetryMixin:
                         upstream_stream_transport=upstream_stream_transport,
                         request_transport=request_transport,
                         concurrency_caps=concurrency_caps,
+                        sticky_rebind=sticky_rebind,
                         useragent=useragent,
                         useragent_group=useragent_group,
                         client_ip=client_ip,
@@ -643,9 +646,10 @@ class _StreamingRetryMixin:
                             request_id=request_id,
                             kind="stream",
                             api_key=api_key,
-                            sticky_key=affinity.key,
+                            sticky_key=affinity.selection_key,
                             sticky_kind=affinity.kind,
                             reallocate_sticky=affinity.reallocate_sticky,
+                            reallocate_sticky_on_account_cap=affinity.reallocate_sticky_on_account_cap,
                             sticky_max_age_seconds=affinity.max_age_seconds,
                             prefer_earlier_reset_accounts=prefer_earlier_reset,
                             prefer_earlier_reset_window=_facade()._prefer_earlier_reset_window(settings),
@@ -655,6 +659,7 @@ class _StreamingRetryMixin:
                             exclude_account_ids=excluded_account_ids,
                             preferred_account_id=preferred_account_id,
                             require_security_work_authorized=require_security_work_authorized,
+                            require_unambiguous_account=affinity.require_unambiguous_account,
                             lease_kind="stream",
                             estimated_lease_tokens=estimated_lease_tokens,
                             fallback_on_preferred_account_unavailable=not file_required_preferred_account,
@@ -693,6 +698,7 @@ class _StreamingRetryMixin:
                         return
                     account = selection.account
                     current_account_lease = selection.lease
+                    current_sticky_rebind = selection.sticky_rebind
                     if selection.lease is not None:
                         account_leases.append(selection.lease)
                     if (
@@ -766,12 +772,15 @@ class _StreamingRetryMixin:
                                 return
                             account = capacity_account
                             current_account_lease = deferred_capacity_lease
+                            current_sticky_rebind = deferred_capacity_sticky_rebind
                             deferred_capacity_account = None
                             deferred_capacity_lease = None
+                            deferred_capacity_sticky_rebind = None
                     if account is not None and deferred_capacity_account is not None:
                         await _release_tracked_stream_lease(deferred_capacity_lease)
                         deferred_capacity_account = None
                         deferred_capacity_lease = None
+                        deferred_capacity_sticky_rebind = None
                     if (
                         not account
                         and (
@@ -1337,6 +1346,7 @@ class _StreamingRetryMixin:
                                 upstream_stream_transport=upstream_stream_transport,
                                 request_transport=request_transport,
                                 concurrency_caps=concurrency_caps,
+                                sticky_rebind=current_sticky_rebind,
                                 useragent=useragent,
                                 useragent_group=useragent_group,
                                 client_ip=client_ip,
@@ -1484,6 +1494,7 @@ class _StreamingRetryMixin:
                                         if can_try_other_account:
                                             deferred_capacity_account = account
                                             deferred_capacity_lease = current_account_lease
+                                            deferred_capacity_sticky_rebind = current_sticky_rebind
                                             excluded_account_ids.add(account.id)
                                             break
                                         remaining_budget_seconds = _facade()._remaining_budget_seconds(deadline)
@@ -1925,6 +1936,7 @@ class _StreamingRetryMixin:
                                 account,
                                 settlement=settlement,
                                 can_try_other_account=can_try_other_account,
+                                sticky_rebind=current_sticky_rebind,
                                 tool_call_dedupe=tool_call_dedupe,
                             ):
                                 yield line
@@ -1986,6 +1998,7 @@ class _StreamingRetryMixin:
                                 if can_try_other_account:
                                     deferred_capacity_account = account
                                     deferred_capacity_lease = current_account_lease
+                                    deferred_capacity_sticky_rebind = current_sticky_rebind
                                     excluded_account_ids.add(account.id)
                                     continue
                                 # The same-account helper only re-raises this

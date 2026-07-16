@@ -34,6 +34,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _release_http_bridge_unanchored_handoff,
     _reserve_http_bridge_unanchored_handoff,
 )
+from app.modules.proxy.affinity import _codex_session_selection_key
 from app.modules.proxy.load_balancer import AccountSelection
 
 pytestmark = pytest.mark.integration
@@ -4826,7 +4827,10 @@ async def test_backend_responses_http_bridge_prefers_codex_session_header_over_p
     _assert_created_text_delta_completed(first_events)
     _assert_created_text_delta_completed(second_events)
     assert len(connect_calls) == 1
-    assert connect_calls[0] == ("backend-http-session-1", proxy_module.StickySessionKind.CODEX_SESSION)
+    assert connect_calls[0] == (
+        _codex_session_selection_key("backend-http-session-1", source="session_header"),
+        proxy_module.StickySessionKind.CODEX_SESSION,
+    )
     assert len(fake_upstream.sent_text) == 2
     assert json.loads(fake_upstream.sent_text[1])["prompt_cache_key"] == "backend-http-prompt-b"
 

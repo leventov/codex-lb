@@ -70,9 +70,11 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_precreated_retry_failure_error,
     _http_bridge_prewarm_enabled,
     _http_bridge_request_counts_against_queue,
+    _http_bridge_session_retiring_with_visible_requests,
     _log_http_bridge_event,
     _record_http_bridge_prewarm_outcome,
     _release_http_bridge_unanchored_handoff,
+    _reserve_http_bridge_unanchored_handoff,
 )
 from app.modules.proxy._service.http_bridge.service_stubs import (
     _classify_upstream_close,
@@ -121,6 +123,7 @@ from app.modules.proxy._service.support import (
     _copy_websocket_route_metadata_from_session,
     _event_type_from_payload,
     _HTTPBridgeSession,
+    _HTTPBridgeSessionKey,
     _request_log_useragent_fields,
     _websocket_request_can_replay_before_visible_output,
     _WebSocketRequestState,
@@ -477,6 +480,168 @@ class _HTTPBridgeRequestSubmitMixin:
         _enforce_response_create_size_limit(request_state)
         return updated_text
 
+    async def _register_or_defer_created_http_bridge_session(
+        self: Any,
+        session: _HTTPBridgeSession,
+        *,
+        creation_key: _HTTPBridgeSessionKey,
+        inflight_future: asyncio.Future[_HTTPBridgeSession] | None,
+        publish_key_after_admission: _HTTPBridgeSessionKey | None,
+        allow_takeover: bool,
+        force_owner_epoch_advance: bool,
+        reserve_unanchored_handoff: bool,
+        request_scope_id: str,
+    ) -> bool:
+        publish_key = publish_key_after_admission
+        if publish_key is None and session.sticky_rebind is not None:
+            publish_key = creation_key
+        if publish_key is not None:
+            # Creating a WebSocket process is intentionally not publication.
+            # Keep both registries untouched until this request has all of its
+            # admission and CAS proof; concurrent callers wait on the marker.
+            session.pending_publish_key = publish_key
+            session.pending_creation_key = creation_key
+            session.pending_creation_future = inflight_future
+            session.pending_durable_allow_takeover = allow_takeover or publish_key != creation_key
+            session.pending_durable_force_owner_epoch_advance = force_owner_epoch_advance or publish_key != creation_key
+            if reserve_unanchored_handoff:
+                _reserve_http_bridge_unanchored_handoff(session, request_scope_id=request_scope_id)
+            return True
+
+        await self._claim_durable_http_bridge_session(
+            session,
+            allow_takeover=allow_takeover,
+            force_owner_epoch_advance=force_owner_epoch_advance,
+        )
+        async with self._http_bridge_lock:
+            if self._http_bridge_inflight_sessions.get(creation_key) is not inflight_future:
+                return False
+            self._http_bridge_inflight_sessions.pop(creation_key, None)
+            if reserve_unanchored_handoff:
+                _reserve_http_bridge_unanchored_handoff(session, request_scope_id=request_scope_id)
+            self._http_bridge_sessions[creation_key] = session
+            if inflight_future is not None and not inflight_future.done():
+                inflight_future.set_result(session)
+        return True
+
+    async def _publish_http_bridge_session_after_admission(
+        self: Any,
+        session: _HTTPBridgeSession,
+    ) -> None:
+        publish_key = session.pending_publish_key
+        pending_rebind = session.sticky_rebind
+        if publish_key is None:
+            if pending_rebind is not None:
+                await self._load_balancer.settle_sticky_rebind(pending_rebind)
+                if session.sticky_rebind is pending_rebind:
+                    session.sticky_rebind = None
+            return
+
+        creation_key = session.pending_creation_key
+        inflight_future = session.pending_creation_future
+        assert creation_key is not None
+        close_replaced: _HTTPBridgeSession | None = None
+        async with self._http_bridge_lock:
+            # Marker validation, sticky CAS, durable fencing, and local swap
+            # share one serialization interval. Waiter timeout cleanup also
+            # takes this lock, so it cannot revoke publication eligibility
+            # between the first persistent write and the canonical handoff.
+            if self._http_bridge_inflight_sessions.get(creation_key) is not inflight_future:
+                raise ProxyResponseError(
+                    503,
+                    openai_error(
+                        "upstream_unavailable",
+                        "HTTP bridge session publication expired; retry the request.",
+                        error_type="server_error",
+                    ),
+                )
+            if pending_rebind is not None and not await self._load_balancer.settle_sticky_rebind(pending_rebind):
+                raise ProxyResponseError(
+                    503,
+                    openai_error(
+                        "upstream_unavailable",
+                        "Session affinity changed concurrently; retry the request.",
+                        error_type="server_error",
+                    ),
+                )
+            session.key = publish_key
+            try:
+                await self._claim_durable_http_bridge_session(
+                    session,
+                    allow_takeover=session.pending_durable_allow_takeover,
+                    force_owner_epoch_advance=session.pending_durable_force_owner_epoch_advance,
+                )
+            except BaseException as exc:
+                session.key = creation_key
+                if pending_rebind is not None:
+                    await self._load_balancer.rollback_sticky_rebind(pending_rebind)
+                logger.warning(
+                    "HTTP bridge publication failed after affinity settlement account_id=%s",
+                    session.account.id,
+                    exc_info=True,
+                )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                raise ProxyResponseError(
+                    503,
+                    openai_error(
+                        "upstream_unavailable",
+                        "HTTP bridge affinity publication failed; retry the request.",
+                        error_type="server_error",
+                    ),
+                ) from exc
+            replaced = self._http_bridge_sessions.get(publish_key)
+            if replaced is not None and replaced is not session:
+                # Existing visible work may finish on its fenced process, but
+                # it must leave the canonical registry before the replacement
+                # is exposed. The terminal path closes it after that drain.
+                replaced.upstream_control.reconnect_requested = True
+                replaced.upstream_control.retire_after_drain = True
+                retiring = _http_bridge_session_retiring_with_visible_requests(replaced)
+                detached = self._detach_http_bridge_session_locked(
+                    publish_key,
+                    expected_session=replaced,
+                    mark_closed=not retiring,
+                )
+                if detached is not None and not retiring:
+                    close_replaced = detached
+            self._http_bridge_inflight_sessions.pop(creation_key, None)
+            self._http_bridge_sessions[publish_key] = session
+            session.pending_publish_key = None
+            session.pending_creation_key = None
+            session.pending_creation_future = None
+            session.pending_durable_allow_takeover = False
+            session.pending_durable_force_owner_epoch_advance = False
+            if session.sticky_rebind is pending_rebind:
+                session.sticky_rebind = None
+            if inflight_future is not None and not inflight_future.done():
+                inflight_future.set_result(session)
+        if close_replaced is not None:
+            self._schedule_http_bridge_session_closes([close_replaced], reason="capacity_rebind_publish")
+
+    async def _discard_unpublished_http_bridge_session(
+        self: Any,
+        session: _HTTPBridgeSession,
+        exc: BaseException,
+    ) -> None:
+        creation_key = session.pending_creation_key
+        inflight_future = session.pending_creation_future
+        if creation_key is None:
+            return
+        async with self._http_bridge_lock:
+            if self._http_bridge_inflight_sessions.get(creation_key) is inflight_future:
+                self._http_bridge_inflight_sessions.pop(creation_key, None)
+                if inflight_future is not None and not inflight_future.done():
+                    if isinstance(exc, asyncio.CancelledError):
+                        inflight_future.cancel()
+                    else:
+                        inflight_future.set_exception(exc)
+                        inflight_future.exception()
+            session.pending_publish_key = None
+            session.pending_creation_key = None
+            session.pending_creation_future = None
+        await self._close_http_bridge_session(session)
+
     async def _submit_http_bridge_request(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -494,6 +659,12 @@ class _HTTPBridgeRequestSubmitMixin:
                 queue_limit=queue_limit,
                 request_scope_id=request_scope_id,
             )
+        except BaseException as exc:
+            # An unpublished replacement owns its stream lease and process;
+            # every pre-send failure must settle its in-flight marker and close
+            # it without disturbing the still-canonical previous session.
+            await self._discard_unpublished_http_bridge_session(session, exc)
+            raise
         finally:
             _release_http_bridge_unanchored_handoff(
                 session,
@@ -662,6 +833,10 @@ class _HTTPBridgeRequestSubmitMixin:
                 bridge_session=session,
             )
             gate_acquired = True
+            # This is the publication barrier: process creation owns only the
+            # stream slot. Canonical bridge/durable ownership and soft affinity
+            # move only after both account and process response-create admission.
+            await self._publish_http_bridge_session_after_admission(session)
             if request_state.bridge_queue_wait_started_at is not None:
                 request_state.latency_bridge_queue_wait_ms = int(
                     max(0.0, _service_time().monotonic() - request_state.bridge_queue_wait_started_at) * 1000

@@ -56,6 +56,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, AdditionalUsageHistory, StickySessionKind, UsageHistory
 from app.modules.proxy.account_cache import get_account_selection_cache, mark_account_routing_unavailable
 from app.modules.proxy.additional_model_limits import get_additional_quota_key_for_model_id
+from app.modules.proxy.affinity import _is_bare_session_selection_key
 from app.modules.proxy.cap_partitioning import (
     configured_account_concurrency_caps,
     get_cap_partition,
@@ -88,6 +89,10 @@ _MAX_SELECTION_ATTEMPTS = 4
 _ACCOUNT_STREAM_LEASE_STALE_GRACE_SECONDS = 60.0
 _STICKY_GRACE_PERIOD_SECONDS = 10.0
 _STICKY_EXISTING_UNSET = object()
+_AMBIGUOUS_CONVERSATION_OWNER_CODE = "conversation_owner_unavailable"
+_AMBIGUOUS_CONVERSATION_OWNER_MESSAGE = (
+    "Conversation owner account cannot be determined from the available account pool; retry later."
+)
 _RECOVERABLE_STATUSES = frozenset(
     {
         AccountStatus.ACTIVE,
@@ -138,12 +143,21 @@ class AccountLease:
     estimated_tokens: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class StickyRebind:
+    key: str
+    kind: StickySessionKind
+    expected_account_id: str | None
+    selected_account_id: str
+
+
 @dataclass
 class AccountSelection:
     account: Account | None
     error_message: str | None
     error_code: str | None = None
     lease: AccountLease | None = None
+    sticky_rebind: StickyRebind | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +211,69 @@ class LoadBalancer:
             return
         async with self._runtime_lock:
             self._release_account_lease_locked(lease, reason="explicit")
+
+    async def settle_sticky_rebind(self, rebind: StickyRebind | None) -> bool:
+        if rebind is None:
+            return False
+        try:
+            async with self._repo_factory() as repos:
+                rebound = await repos.sticky_sessions.rebind_if_current(
+                    rebind.key,
+                    rebind.selected_account_id,
+                    kind=rebind.kind,
+                    expected_account_id=rebind.expected_account_id,
+                )
+        except Exception:
+            # Affinity is a locality optimization after admission, not account
+            # health. A database outage must not turn into an upstream failure
+            # or penalize the account that successfully accepted the request.
+            logger.warning(
+                "sticky_rebind_persistence_failed old_account_id=%s new_account_id=%s sticky_kind=%s",
+                rebind.expected_account_id,
+                rebind.selected_account_id,
+                rebind.kind.value,
+                exc_info=True,
+            )
+            return False
+        if rebound:
+            # Sticky keys identify user conversations. Keep this diagnostic to
+            # account IDs and the stable event name; never add the raw key.
+            logger.info(
+                "internal_soft_affinity_reroute old_account_id=%s new_account_id=%s sticky_kind=%s",
+                rebind.expected_account_id,
+                rebind.selected_account_id,
+                rebind.kind.value,
+            )
+        return rebound
+
+    async def rollback_sticky_rebind(self, rebind: StickyRebind | None) -> bool:
+        if rebind is None:
+            return False
+        try:
+            async with self._repo_factory() as repos:
+                if rebind.expected_account_id is None:
+                    rolled_back = await repos.sticky_sessions.delete_if_current(
+                        rebind.key,
+                        kind=rebind.kind,
+                        expected_account_id=rebind.selected_account_id,
+                    )
+                else:
+                    rolled_back = await repos.sticky_sessions.rebind_if_current(
+                        rebind.key,
+                        rebind.expected_account_id,
+                        kind=rebind.kind,
+                        expected_account_id=rebind.selected_account_id,
+                    )
+        except Exception:
+            logger.warning(
+                "sticky_rebind_rollback_failed old_account_id=%s new_account_id=%s sticky_kind=%s",
+                rebind.expected_account_id,
+                rebind.selected_account_id,
+                rebind.kind.value,
+                exc_info=True,
+            )
+            return False
+        return rolled_back
 
     async def acquire_account_lease(
         self,
@@ -323,6 +400,7 @@ class LoadBalancer:
         *,
         sticky_kind: StickySessionKind | None = None,
         reallocate_sticky: bool = False,
+        reallocate_sticky_on_account_cap: bool = False,
         sticky_max_age_seconds: int | None = None,
         prefer_earlier_reset_accounts: bool = False,
         prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
@@ -335,6 +413,7 @@ class LoadBalancer:
         account_ids: Collection[str] | None = None,
         exclude_account_ids: Collection[str] | None = None,
         require_security_work_authorized: bool = False,
+        require_unambiguous_account: bool = False,
         budget_threshold_pct: float = 95.0,
         secondary_budget_threshold_pct: float = 100.0,
         routing_costs_by_account_id: RoutingCostsByAccount | None = None,
@@ -383,6 +462,19 @@ class LoadBalancer:
                     persist_standard_quota_status=selection_inputs.persist_standard_quota_status,
                     routing_policy_override=selection_inputs.routing_policy_override,
                 )
+            sticky_can_prove_owner = sticky_key is not None and sticky_kind == StickySessionKind.CODEX_SESSION
+            if require_unambiguous_account and (
+                not selection_inputs.accounts or (len(selection_inputs.accounts) != 1 and not sticky_can_prove_owner)
+            ):
+                # ``conversation`` has no dedicated owner index. A persisted
+                # hard Codex-session mapping may still prove ownership below;
+                # otherwise only a one-account eligible pool is unambiguous.
+                return replace(
+                    selection_inputs,
+                    accounts=[],
+                    error_message=_AMBIGUOUS_CONVERSATION_OWNER_MESSAGE,
+                    error_code=_AMBIGUOUS_CONVERSATION_OWNER_CODE,
+                )
             if excluded_ids and selection_inputs.accounts:
                 filtered_accounts = [account for account in selection_inputs.accounts if account.id not in excluded_ids]
                 if require_security_work_authorized and not filtered_accounts:
@@ -410,6 +502,12 @@ class LoadBalancer:
                     persist_standard_quota_status=selection_inputs.persist_standard_quota_status,
                     routing_policy_override=selection_inputs.routing_policy_override,
                 )
+                if require_unambiguous_account and not filtered_accounts:
+                    selection_inputs = replace(
+                        selection_inputs,
+                        error_message=_AMBIGUOUS_CONVERSATION_OWNER_MESSAGE,
+                        error_code=_AMBIGUOUS_CONVERSATION_OWNER_CODE,
+                    )
             return selection_inputs
 
         selection_inputs = await load_selection_inputs()
@@ -434,6 +532,7 @@ class LoadBalancer:
         selected_states: list[AccountState] = []
         selected_account_map: dict[str, Account] = {}
         selected_lease: AccountLease | None = None
+        sticky_rebind: StickyRebind | None = None
         selection_error_code: str | None = None
         if sticky_key is None:
             attempt = 0
@@ -624,6 +723,7 @@ class LoadBalancer:
             attempt = 0
             while True:
                 attempt += 1
+                sticky_rebind = None
                 async with self._runtime_lock:
                     self._reclaim_stale_account_leases_locked()
                     self._prune_runtime(selection_inputs.runtime_accounts or selection_inputs.accounts)
@@ -652,20 +752,61 @@ class LoadBalancer:
                             kind=sticky_kind,
                             max_age_seconds=sticky_max_age_seconds,
                         )
-                hard_sticky = sticky_kind == StickySessionKind.CODEX_SESSION and isinstance(
-                    sticky_existing_account_id, str
+                if (
+                    require_unambiguous_account
+                    and not isinstance(sticky_existing_account_id, str)
+                    and len(selection_inputs.accounts) != 1
+                ):
+                    return AccountSelection(
+                        account=None,
+                        error_message=_AMBIGUOUS_CONVERSATION_OWNER_MESSAGE,
+                        error_code=_AMBIGUOUS_CONVERSATION_OWNER_CODE,
+                    )
+                cap_rebind_allowed = (
+                    reallocate_sticky_on_account_cap
+                    and sticky_kind == StickySessionKind.CODEX_SESSION
+                    and lease_kind is not None
+                    and _is_bare_session_selection_key(sticky_key)
                 )
-                selection_states = (
-                    states
-                    if hard_sticky
-                    else _filter_states_for_account_caps(
+                hard_sticky = (
+                    sticky_kind == StickySessionKind.CODEX_SESSION
+                    and isinstance(sticky_existing_account_id, str)
+                    and not cap_rebind_allowed
+                )
+                # CODEX_SESSION also represents bare process-session locality.
+                # Both the service capability and the source-namespaced key are
+                # required; raw/legacy keys remain hard even if a future caller
+                # accidentally forwards the capability bit.
+                if hard_sticky:
+                    # A resolved hard mapping is an ownership constraint, not
+                    # a preference. Exclusions, model/API-key scope, health,
+                    # and budget pressure may make its owner unavailable, but
+                    # none authorize rebinding the continuation to another
+                    # account or deleting the mapping.
+                    selection_states = [state for state in states if state.account_id == sticky_existing_account_id]
+                else:
+                    selection_states = _filter_states_for_account_caps(
                         states,
                         lease_kind=lease_kind,
                         caps=caps,
                         stream_reserve_slots=stream_reserve_slots,
                     )
-                )
-                if not selection_states and states:
+                if cap_rebind_allowed and lease_kind == "stream":
+                    # A new stream immediately needs an account response-create
+                    # slot. Prefer candidates that can satisfy both stages, but
+                    # retain the stream set when every candidate is create-capped
+                    # so the transport reports the correct second-stage reason.
+                    response_create_states = _filter_states_for_account_caps(
+                        selection_states,
+                        lease_kind="response_create",
+                        caps=caps,
+                        stream_reserve_slots=0,
+                    )
+                    selection_states = response_create_states or selection_states
+                if hard_sticky and not selection_states:
+                    selection_error_code = "hard_affinity_saturated"
+                    result = SelectionResult(None, "Hard affinity owner account is unavailable")
+                elif not selection_states and states:
                     selection_error_code = _account_cap_error_code(lease_kind)
                     result = SelectionResult(None, _account_cap_error_message(lease_kind, caps))
                     logger.warning(
@@ -683,7 +824,7 @@ class LoadBalancer:
                             account_map=account_map,
                             sticky_key=sticky_key,
                             sticky_kind=sticky_kind,
-                            reallocate_sticky=reallocate_sticky,
+                            reallocate_sticky=False if hard_sticky else reallocate_sticky,
                             sticky_max_age_seconds=sticky_max_age_seconds,
                             budget_threshold_pct=budget_threshold_pct,
                             secondary_budget_threshold_pct=secondary_budget_threshold_pct,
@@ -694,10 +835,13 @@ class LoadBalancer:
                             relative_availability_top_k=relative_availability_top_k,
                             sticky_repo=repos.sticky_sessions,
                             sticky_existing_account_id=sticky_existing_account_id,
+                            persist_sticky_selection=not cap_rebind_allowed and not hard_sticky,
                             traffic_class=traffic_class,
                             ignore_standard_quota=False,
                             routing_costs_by_account_id=effective_routing_costs,
                         )
+                    if hard_sticky and result.account is None:
+                        selection_error_code = "hard_affinity_saturated"
                 selected_account_map = account_map
                 selected_states = []
                 async with self._runtime_lock:
@@ -758,6 +902,25 @@ class LoadBalancer:
                     selected_lease = None
                     raise
                 stale_account_ids = stale_account_ids or set()
+                if (
+                    cap_rebind_allowed
+                    and selected_snapshot is not None
+                    and selected_lease is not None
+                    and selected_snapshot.id not in stale_account_ids
+                    and sticky_kind is not None
+                    and sticky_existing_account_id != selected_snapshot.id
+                ):
+                    # Selection proves only this first account lease. The
+                    # transport settles after its second-stage admission so a
+                    # response-create cap failure cannot steal session affinity.
+                    sticky_rebind = StickyRebind(
+                        key=sticky_key,
+                        kind=sticky_kind,
+                        expected_account_id=(
+                            sticky_existing_account_id if isinstance(sticky_existing_account_id, str) else None
+                        ),
+                        selected_account_id=selected_snapshot.id,
+                    )
                 if selected_snapshot is not None and selected_snapshot.id in stale_account_ids:
                     await self.release_account_lease(selected_lease)
                     selected_lease = None
@@ -823,7 +986,13 @@ class LoadBalancer:
             bool(sticky_key),
             model,
         )
-        return AccountSelection(account=selected_snapshot, error_message=None, error_code=None, lease=selected_lease)
+        return AccountSelection(
+            account=selected_snapshot,
+            error_message=None,
+            error_code=None,
+            lease=selected_lease,
+            sticky_rebind=sticky_rebind,
+        )
 
     async def _load_selection_inputs(
         self,
@@ -1281,6 +1450,7 @@ class LoadBalancer:
         sticky_repo: StickySessionsRepository | None,
         routing_costs_by_account_id: RoutingCostsByAccount | None = None,
         sticky_existing_account_id: str | None | object = _STICKY_EXISTING_UNSET,
+        persist_sticky_selection: bool = True,
         traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
         ignore_standard_quota: bool = False,
     ) -> SelectionResult:
@@ -1381,7 +1551,7 @@ class LoadBalancer:
                         routing_costs=routing_costs_by_account_id,
                     )
                     if pinned_result.account is not None:
-                        if sticky_max_age_seconds is not None:
+                        if persist_sticky_selection and sticky_max_age_seconds is not None:
                             await sticky_repo.upsert(sticky_key, pinned.account_id, kind=sticky_kind)
                         return pinned_result
                 else:
@@ -1432,7 +1602,7 @@ class LoadBalancer:
                                 routing_costs=routing_costs_by_account_id,
                             )
                             if pinned_result.account is not None:
-                                if sticky_max_age_seconds is not None:
+                                if persist_sticky_selection and sticky_max_age_seconds is not None:
                                     await sticky_repo.upsert(
                                         sticky_key,
                                         pinned.account_id,
@@ -1462,10 +1632,10 @@ class LoadBalancer:
                         routing_costs=routing_costs_by_account_id,
                     )
                     if grace_result.account is not None:
-                        if sticky_max_age_seconds is not None:
+                        if persist_sticky_selection and sticky_max_age_seconds is not None:
                             await sticky_repo.upsert(sticky_key, pinned.account_id, kind=sticky_kind)
                         return grace_result
-                if reallocate_sticky:
+                if reallocate_sticky and persist_sticky_selection:
                     await sticky_repo.delete(sticky_key, kind=sticky_kind)
                 elif pinned.status not in _RECOVERABLE_STATUSES:
                     # Permanently down (PAUSED/DEACTIVATED) — let the
@@ -1480,7 +1650,7 @@ class LoadBalancer:
                 # else: durable kind without TTL (CODEX_SESSION) — persist
                 # fallback so the session sticks to one account during
                 # the outage instead of bouncing across random fallbacks.
-            else:
+            elif persist_sticky_selection:
                 await sticky_repo.delete(sticky_key, kind=sticky_kind)
 
         chosen = _select_account_preferring_budget_safe(
@@ -1497,7 +1667,12 @@ class LoadBalancer:
             ignore_standard_quota=ignore_standard_quota,
             routing_costs_by_account_id=routing_costs_by_account_id,
         )
-        if persist_fallback and chosen.account is not None and chosen.account.account_id in account_map:
+        if (
+            persist_sticky_selection
+            and persist_fallback
+            and chosen.account is not None
+            and chosen.account.account_id in account_map
+        ):
             await sticky_repo.upsert(sticky_key, chosen.account.account_id, kind=sticky_kind)
         return chosen
 

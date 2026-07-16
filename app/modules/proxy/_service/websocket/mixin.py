@@ -827,7 +827,8 @@ class _WebSocketMixin:
                 if replay_request_state is not None:
                     request_state = replay_request_state
                     replay_request_state = None
-                    request_state.request_stage = "reattach"
+                    if request_state.request_stage != "capacity_reroute":
+                        request_state.request_stage = "reattach"
                     request_affinity = request_state.affinity_policy
                     text_data = request_state.request_text
                     if text_data is None:
@@ -1271,7 +1272,7 @@ class _WebSocketMixin:
                     connect_headers = _facade()._headers_with_turn_state(filtered_headers, upstream_turn_state)
                     account, upstream = await proxy._connect_proxy_websocket(
                         connect_headers,
-                        sticky_key=request_affinity.key,
+                        sticky_key=request_affinity.selection_key,
                         sticky_kind=request_affinity.kind,
                         reallocate_sticky=request_affinity.reallocate_sticky,
                         sticky_max_age_seconds=request_affinity.max_age_seconds,
@@ -1322,7 +1323,20 @@ class _WebSocketMixin:
                         )
                     )
 
+                upstream_send_started = False
                 try:
+                    if (
+                        text_data is not None
+                        and request_state is not None
+                        and payload is not None
+                        and account is not None
+                        and _is_websocket_response_create(payload)
+                        and request_state.account_response_create_lease is not None
+                        and request_state.account_response_create_lease.account_id != account.id
+                    ):
+                        # A replay may retain the prior socket's create lease.
+                        # Never let that lease admit a frame on another account.
+                        await proxy._release_request_state_account_response_create_lease(request_state)
                     if (
                         text_data is not None
                         and request_state is not None
@@ -1341,6 +1355,11 @@ class _WebSocketMixin:
                             )
                         )
                         request_state.account_response_create_release = proxy._load_balancer.release_account_lease
+                        # The request crossed process admission before connect;
+                        # this second account-local lease completes the transport
+                        # handoff and is the earliest safe affinity commit point.
+                        await proxy._load_balancer.settle_sticky_rebind(request_state.sticky_rebind)
+                        request_state.sticky_rebind = None
                     if (
                         text_data is not None
                         and request_state is not None
@@ -1361,16 +1380,52 @@ class _WebSocketMixin:
                     if text_data is not None:
                         archive_request_id = None if request_state is None else request_state.archive_request_id
                         with _websocket_archive_request_context(archive_request_id):
+                            upstream_send_started = True
                             await upstream.send_text(text_data)
+                        if (
+                            request_state is not None
+                            and account is not None
+                            and payload is not None
+                            and _is_websocket_response_create(payload)
+                            and request_state.request_stage == "capacity_reroute"
+                        ):
+                            # Capacity mobility is consumed by this successful
+                            # handoff. Any later replay is continuity recovery
+                            # and must stay on the account that saw the frame.
+                            request_state.request_stage = "reattach"
+                            request_state.preferred_account_id = account.id
+                            request_state.replay_requires_preferred_account = True
                     elif bytes_data is not None:
                         archive_request_id = None if request_state is None else request_state.archive_request_id
                         with _websocket_archive_request_context(archive_request_id):
+                            upstream_send_started = True
                             await upstream.send_bytes(bytes_data)
                 except ProxyResponseError as exc:
                     error = _parse_openai_error(exc.payload)
                     error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
                     error_message = error.message if error and error.message else "Upstream error"
                     error_type = error.type if error and error.type else "server_error"
+                    if (
+                        not upstream_send_started
+                        and error_code == "account_response_create_cap"
+                        and request_state is not None
+                        and request_state_registered
+                        and account is not None
+                        and request_state.affinity_policy.reallocate_sticky_on_account_cap
+                    ):
+                        # Global admission remains owned by this request. Move
+                        # the pre-send frame back through account selection,
+                        # excluding the create-capped socket owner; generic
+                        # reattach paths remain hard and cannot use this stage.
+                        async with pending_lock:
+                            if request_state in pending_requests:
+                                pending_requests.remove(request_state)
+                        request_state.excluded_account_ids.add(account.id)
+                        request_state.request_stage = "capacity_reroute"
+                        request_state.request_text = text_data
+                        replay_request_state = request_state
+                        await retire_current_upstream()
+                        continue
                     if request_state is not None:
                         await proxy._release_websocket_request_state_reservation(request_state)
                         if request_state_registered:
@@ -1917,8 +1972,10 @@ class _WebSocketMixin:
             forced_refresh_account_id = request_state.force_refresh_account_id
             preferred_account_id = forced_refresh_account_id or request_state.preferred_account_id
             require_preferred_account = (
-                request_state.previous_response_id is not None and request_state.preferred_account_id is not None
-            ) or request_state.file_required_preferred_account
+                (request_state.previous_response_id is not None and request_state.preferred_account_id is not None)
+                or request_state.file_required_preferred_account
+                or request_state.replay_requires_preferred_account
+            )
             try:
                 account = await proxy._select_websocket_connect_account(
                     deadline,
@@ -2101,6 +2158,7 @@ class _WebSocketMixin:
     ) -> Account | None:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
+        request_state.sticky_rebind = None
         while True:
             try:
                 selection = await proxy._select_account_with_budget_compatible(
@@ -2111,6 +2169,7 @@ class _WebSocketMixin:
                     sticky_key=sticky_key,
                     sticky_kind=sticky_kind,
                     reallocate_sticky=reallocate_sticky,
+                    reallocate_sticky_on_account_cap=(request_state.affinity_policy.reallocate_sticky_on_account_cap),
                     sticky_max_age_seconds=sticky_max_age_seconds,
                     prefer_earlier_reset_accounts=prefer_earlier_reset,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
@@ -2120,6 +2179,7 @@ class _WebSocketMixin:
                     exclude_account_ids=exclude_account_ids,
                     preferred_account_id=preferred_account_id,
                     require_security_work_authorized=require_security_work_authorized,
+                    require_unambiguous_account=request_state.affinity_policy.require_unambiguous_account,
                     lease_kind="stream",
                     request_stage=request_state.request_stage,
                     estimated_lease_tokens=_facade()._estimated_lease_tokens_from_request_usage_budget(
@@ -2209,6 +2269,7 @@ class _WebSocketMixin:
             return None
         if account:
             request_state.websocket_stream_lease = selection.lease
+            request_state.sticky_rebind = selection.sticky_rebind
             return account
         if defer_no_account_error and not _facade()._is_local_account_cap_code(selection.error_code):
             _facade().logger.warning(

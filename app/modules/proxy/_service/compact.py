@@ -38,12 +38,14 @@ from app.modules.api_keys.service import (
 )
 from app.modules.proxy._service.support import _request_log_useragent_fields, _RequestLogFailureMetadata
 from app.modules.proxy.affinity import (
+    _affinity_with_payload_continuity,
     _AffinityPolicy,
+    _bare_codex_session_affinity,
     _is_synthesized_turn_state,
     _owner_lookup_session_id_from_headers,
     _prompt_cache_key_from_request_model,
+    _request_allows_bare_session_cap_rebind,
     _resolve_prompt_cache_key,
-    _sticky_key_from_session_header,
     _sticky_key_from_turn_state_header,
 )
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
@@ -52,6 +54,7 @@ from app.modules.proxy.load_balancer import (
     AccountConcurrencyCaps,
     AccountLease,
     AccountSelection,
+    StickyRebind,
     effective_account_concurrency_caps,
 )
 from app.modules.proxy.work_admission import AdmissionLease, WorkAdmissionController
@@ -408,30 +411,34 @@ def _sticky_key_for_compact_request(
     )
     turn_state_key = _sticky_key_from_turn_state_header(headers)
     if turn_state_key:
-        return _AffinityPolicy(
+        policy = _AffinityPolicy(
             key=turn_state_key,
             kind=StickySessionKind.CODEX_SESSION,
+            codex_session_source="turn_state",
         )
-    if codex_session_affinity:
-        session_key = _sticky_key_from_session_header(headers)
-        if session_key:
-            return _AffinityPolicy(
-                key=session_key,
-                kind=StickySessionKind.CODEX_SESSION,
-            )
-    if openai_cache_affinity:
-        return _AffinityPolicy(
+    elif (
+        session_affinity := _bare_codex_session_affinity(
+            headers,
+            enabled=codex_session_affinity,
+            allow_cap_rebind=_request_allows_bare_session_cap_rebind(payload),
+        )
+    ) is not None:
+        policy = session_affinity
+    elif openai_cache_affinity:
+        policy = _AffinityPolicy(
             key=cache_key,
             kind=StickySessionKind.PROMPT_CACHE,
             max_age_seconds=openai_cache_affinity_max_age_seconds,
         )
-    if sticky_threads_enabled:
-        return _AffinityPolicy(
+    elif sticky_threads_enabled:
+        policy = _AffinityPolicy(
             key=cache_key,
             kind=StickySessionKind.STICKY_THREAD,
             reallocate_sticky=True,
         )
-    return _AffinityPolicy()
+    else:
+        policy = _AffinityPolicy()
+    return _affinity_with_payload_continuity(policy, payload)
 
 
 def _service_tier_from_compact_payload(payload: ResponsesCompactRequest) -> str | None:
@@ -660,6 +667,7 @@ class _CompactMixin:
             async def _call_compact(
                 target: Account,
                 account_response_create_lease: AccountLease | None = None,
+                sticky_rebind: StickyRebind | None = None,
             ) -> CompactResponsePayload:
                 nonlocal route_fallback_used, route_mode, route_pool_id, route_endpoint_id
                 access_token = proxy._encryptor.decrypt(target.access_token_encrypted)
@@ -683,6 +691,10 @@ class _CompactMixin:
                             concurrency_caps=concurrency_caps,
                         )
                     create_lease = await proxy._get_work_admission().acquire_response_create(compact=True)
+                    # The selected account now owns both cap-sensitive stages.
+                    # Settling earlier would move affinity when either the
+                    # account lease or process admission ultimately rejects.
+                    await proxy._load_balancer.settle_sticky_rebind(sticky_rebind)
                     route = await proxy._resolve_upstream_route_for_account(target, operation="compact")
                     remaining_budget = _remaining_budget_seconds(deadline)
                     if remaining_budget <= 0:
@@ -815,9 +827,10 @@ class _CompactMixin:
                     request_id=request_id,
                     kind="compact",
                     api_key=api_key,
-                    sticky_key=affinity.key,
+                    sticky_key=affinity.selection_key,
                     sticky_kind=affinity.kind,
                     reallocate_sticky=affinity.reallocate_sticky,
+                    reallocate_sticky_on_account_cap=affinity.reallocate_sticky_on_account_cap,
                     sticky_max_age_seconds=affinity.max_age_seconds,
                     prefer_earlier_reset_accounts=prefer_earlier_reset,
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
@@ -827,6 +840,7 @@ class _CompactMixin:
                     exclude_account_ids=excluded_account_ids,
                     preferred_account_id=preferred_account_id,
                     require_security_work_authorized=require_security_work_authorized,
+                    require_unambiguous_account=affinity.require_unambiguous_account,
                     lease_kind="response_create",
                     estimated_lease_tokens=estimated_lease_tokens,
                     fallback_on_preferred_account_unavailable=preferred_account_id is None,
@@ -849,9 +863,10 @@ class _CompactMixin:
                             request_id=request_id,
                             kind="compact",
                             api_key=api_key,
-                            sticky_key=affinity.key,
+                            sticky_key=affinity.selection_key,
                             sticky_kind=affinity.kind,
                             reallocate_sticky=affinity.reallocate_sticky,
+                            reallocate_sticky_on_account_cap=affinity.reallocate_sticky_on_account_cap,
                             sticky_max_age_seconds=affinity.max_age_seconds,
                             prefer_earlier_reset_accounts=prefer_earlier_reset,
                             prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
@@ -861,6 +876,7 @@ class _CompactMixin:
                             exclude_account_ids=excluded_account_ids,
                             preferred_account_id=preferred_account_id,
                             require_security_work_authorized=False,
+                            require_unambiguous_account=affinity.require_unambiguous_account,
                             lease_kind="response_create",
                             estimated_lease_tokens=estimated_lease_tokens,
                             fallback_on_preferred_account_unavailable=preferred_account_id is None,
@@ -1096,7 +1112,11 @@ class _CompactMixin:
                     try:
                         account_response_create_lease = selected_account_response_create_lease
                         selected_account_response_create_lease = None
-                        response = await _call_compact(account, account_response_create_lease)
+                        response = await _call_compact(
+                            account,
+                            account_response_create_lease,
+                            selection.sticky_rebind,
+                        )
                         network_recovery.log_recovered()
                         actual_service_tier = _service_tier_from_response(response)
                         await proxy._load_balancer.record_success(account)
@@ -1398,16 +1418,33 @@ class _CompactMixin:
                                 code,
                                 http_status=exc.status_code,
                             )
-                            if affinity.key is not None and affinity.kind is not None:
+                            clear_timeout_mapping = (
+                                affinity.selection_key is not None
+                                and affinity.kind is not None
+                                and (
+                                    affinity.kind != StickySessionKind.CODEX_SESSION
+                                    or affinity.reallocate_sticky_on_account_cap
+                                )
+                            )
+                            if clear_timeout_mapping:
                                 try:
                                     async with proxy._repo_factory() as repos:
-                                        await repos.sticky_sessions.delete(affinity.key, kind=affinity.kind)
-                                    logger.info(
-                                        "Compact sticky mapping cleared after upstream timeout request_id=%s "
-                                        "sticky_kind=%s",
-                                        request_id,
-                                        affinity.kind.value,
-                                    )
+                                        # Bare session headers persist under an opaque
+                                        # source namespace. Compare its observed
+                                        # owner as well: a stale timeout must not
+                                        # delete a newer request's successful CAS.
+                                        cleared = await repos.sticky_sessions.delete_if_current(
+                                            affinity.selection_key,
+                                            kind=affinity.kind,
+                                            expected_account_id=account.id,
+                                        )
+                                    if cleared:
+                                        logger.info(
+                                            "Compact sticky mapping cleared after upstream timeout request_id=%s "
+                                            "sticky_kind=%s",
+                                            request_id,
+                                            affinity.kind.value,
+                                        )
                                 except Exception:
                                     logger.warning(
                                         "Failed to clear compact sticky mapping after upstream timeout "

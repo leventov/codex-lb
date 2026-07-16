@@ -410,7 +410,7 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
-from app.modules.proxy.load_balancer import AccountConcurrencyCaps, AccountLease
+from app.modules.proxy.load_balancer import AccountConcurrencyCaps, AccountLease, StickyRebind
 from app.modules.proxy.tool_call_dedupe import mark_duplicate_tool_call_downstream_event
 from app.modules.proxy.tool_call_dedupe import (
     response_id_from_payload as tool_call_response_id_from_payload,
@@ -482,6 +482,7 @@ class _StreamingMixin(_StreamingRetryMixin):
         upstream_stream_transport: str | None,
         request_transport: str,
         concurrency_caps: AccountConcurrencyCaps | None = None,
+        sticky_rebind: StickyRebind | None = None,
         useragent: str | None = None,
         useragent_group: str | None = None,
         client_ip: str | None = None,
@@ -547,6 +548,9 @@ class _StreamingMixin(_StreamingRetryMixin):
                 concurrency_caps=concurrency_caps or _facade().effective_account_concurrency_caps(),
             )
             response_create_lease = await proxy._get_work_admission().acquire_response_create()
+            # Stream selection owns only the stream slot; settle after the
+            # response-create slot and process admission complete as well.
+            await proxy._load_balancer.settle_sticky_rebind(sticky_rebind)
             attempt_started_at = time.monotonic()
             latency_queue_ms = max(0, int((attempt_started_at - request_started_at) * 1000))
             stream_optional_kwargs: dict[str, object] = {

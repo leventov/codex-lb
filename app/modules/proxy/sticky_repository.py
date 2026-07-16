@@ -4,8 +4,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import Insert as PostgreSQLInsert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import Insert as SQLiteInsert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Insert
@@ -23,6 +25,7 @@ from app.modules.sticky_sessions.schemas import StickySessionSortBy, StickySessi
 # ships with current Python interpreters. Postgres allows up to 65535
 # bind parameters, which this chunk size also respects.
 _DELETE_ENTRIES_CHUNK_SIZE = 250
+_DialectInsert = PostgreSQLInsert | SQLiteInsert
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,12 +82,69 @@ class StickySessionsRepository:
             raise RuntimeError(f"StickySession upsert failed for key={key!r} kind={kind.value!r}")
         return row
 
+    async def rebind_if_current(
+        self,
+        key: str,
+        account_id: str,
+        *,
+        kind: StickySessionKind,
+        expected_account_id: str | None,
+    ) -> bool:
+        if not key:
+            return False
+        # Selection and transport admission are intentionally separated. This
+        # CAS prevents a late retry from overwriting ownership established by a
+        # newer request while it waited for its final account-local lease.
+        if expected_account_id is None:
+            statement = (
+                self._build_insert_statement(key, account_id, kind)
+                .on_conflict_do_nothing(index_elements=[StickySession.key, StickySession.kind])
+                .returning(StickySession.key)
+            )
+        else:
+            statement = (
+                update(StickySession)
+                .where(
+                    StickySession.key == key,
+                    StickySession.kind == kind,
+                    StickySession.account_id == expected_account_id,
+                )
+                .values(account_id=account_id, updated_at=func.now())
+                .returning(StickySession.key)
+            )
+        async with sqlite_writer_section():
+            result = await self._session.execute(statement)
+            rebound = result.scalar_one_or_none() is not None
+            await self._session.commit()
+        return rebound
+
     async def delete(self, key: str, *, kind: StickySessionKind) -> bool:
         if not key:
             return False
         statement = delete(StickySession).where(
             StickySession.key == key,
             StickySession.kind == kind,
+        )
+        async with sqlite_writer_section():
+            result = await self._session.execute(statement.returning(StickySession.key))
+            await self._session.commit()
+        return result.scalar_one_or_none() is not None
+
+    async def delete_if_current(
+        self,
+        key: str,
+        *,
+        kind: StickySessionKind,
+        expected_account_id: str,
+    ) -> bool:
+        if not key:
+            return False
+        # Timeout cleanup races later successful requests. Match the observed
+        # owner so a stale failure cannot erase a newer affinity settlement.
+        statement = delete(StickySession).where(
+            StickySession.key == key,
+            StickySession.kind == kind,
+            StickySession.account_id == expected_account_id,
         )
         async with sqlite_writer_section():
             result = await self._session.execute(statement.returning(StickySession.key))
@@ -204,6 +264,15 @@ class StickySessionsRepository:
         return deleted
 
     def _build_upsert_statement(self, key: str, account_id: str, kind: StickySessionKind) -> Insert:
+        return self._build_insert_statement(key, account_id, kind).on_conflict_do_update(
+            index_elements=[StickySession.key, StickySession.kind],
+            set_={
+                "account_id": account_id,
+                "updated_at": func.now(),
+            },
+        )
+
+    def _build_insert_statement(self, key: str, account_id: str, kind: StickySessionKind) -> _DialectInsert:
         dialect = self._session.get_bind().dialect.name
         if dialect == "postgresql":
             insert_fn = pg_insert
@@ -211,14 +280,7 @@ class StickySessionsRepository:
             insert_fn = sqlite_insert
         else:
             raise RuntimeError(f"StickySession upsert unsupported for dialect={dialect!r}")
-        statement = insert_fn(StickySession).values(key=key, account_id=account_id, kind=kind)
-        return statement.on_conflict_do_update(
-            index_elements=[StickySession.key, StickySession.kind],
-            set_={
-                "account_id": account_id,
-                "updated_at": func.now(),
-            },
-        )
+        return insert_fn(StickySession).values(key=key, account_id=account_id, kind=kind)
 
     @staticmethod
     def _apply_filters(

@@ -1531,7 +1531,10 @@ class _HTTPBridgeStreamingMixin:
         )
         request_state.file_required_preferred_account = file_required_preferred_account
         request_state.bridge_soft_capacity_reroute_allowed = (
-            bridge_session_key.strength == "soft"
+            (
+                bridge_session_key.strength == "soft"
+                or (affinity.reallocate_sticky_on_account_cap and session.last_completed_response_id is None)
+            )
             and request_state.previous_response_id is None
             and not file_required_preferred_account
         )
@@ -1657,14 +1660,19 @@ class _HTTPBridgeStreamingMixin:
                     except Exception:
                         pass
                 return
+            error_code, _ = _proxy_error_code_message(exc)
+            cap_reroute = request_state.bridge_soft_capacity_reroute_allowed and error_code in {
+                "account_response_create_cap",
+                "account_stream_cap",
+            }
             if (
-                _http_bridge_should_attempt_soft_affinity_reroute(
+                cap_reroute
+                or _http_bridge_should_attempt_soft_affinity_reroute(
                     exc,
                     key=bridge_session_key,
                     previous_response_id=effective_payload.previous_response_id,
                 )
-                and not file_required_preferred_account
-            ):
+            ) and not file_required_preferred_account:
                 _log_http_bridge_event(
                     "internal_soft_affinity_reroute",
                     bridge_session_key,
@@ -1681,16 +1689,17 @@ class _HTTPBridgeStreamingMixin:
                     bridge_session_key.api_key_id,
                     strength="soft",
                 )
+                reroute_affinity = affinity if cap_reroute else _AffinityPolicy()
                 while True:
                     try:
                         reroute_session = await self._get_or_create_http_bridge_session(
                             reroute_key,
                             headers=dict(headers),
-                            affinity=_AffinityPolicy(),
+                            affinity=reroute_affinity,
                             api_key=api_key,
                             request_model=effective_payload.model,
                             idle_ttl_seconds=_effective_http_bridge_idle_ttl_seconds(
-                                affinity=_AffinityPolicy(),
+                                affinity=reroute_affinity,
                                 idle_ttl_seconds=idle_ttl_seconds,
                                 codex_idle_ttl_seconds=codex_idle_ttl_seconds,
                                 prompt_cache_idle_ttl_seconds=prompt_cache_idle_ttl_seconds,
@@ -1705,6 +1714,11 @@ class _HTTPBridgeStreamingMixin:
                             preferred_account_id=None,
                             request_usage_budget=request_state.request_usage_budget,
                             request_deadline=request_deadline,
+                            # The random key isolates process creation only.
+                            # Once admitted, a cap reroute must replace the
+                            # canonical lane or the next request would reuse
+                            # the capped bridge and repeat the same failure.
+                            publish_key_after_admission=bridge_session_key if cap_reroute else None,
                         )
                     except ProxyResponseError as capacity_exc:
                         wait_plan = _http_bridge_capacity_wait_plan(capacity_exc, request_deadline=request_deadline)

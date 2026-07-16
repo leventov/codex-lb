@@ -15,6 +15,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
+from app.modules.proxy.affinity import _codex_session_selection_key
 from app.modules.usage.repository import UsageRepository
 
 pytestmark = pytest.mark.integration
@@ -1026,7 +1027,7 @@ async def test_backend_codex_session_affinity_also_forwards_prompt_cache_key_whe
         row = (
             await session.execute(
                 text("SELECT kind FROM sticky_sessions WHERE key = :key"),
-                {"key": "backend-thread-123"},
+                {"key": _codex_session_selection_key("backend-thread-123", source="session_header")},
             )
         ).fetchone()
         assert row is not None
@@ -1499,3 +1500,67 @@ async def test_sticky_upsert_returning_refreshes_identity_map_instance(db_setup)
         # stale in-memory account_id.
         second = await repo.upsert("key_rebind", "acc_rebind_b", kind=StickySessionKind.PROMPT_CACHE)
         assert second.account_id == "acc_rebind_b"
+
+
+@pytest.mark.asyncio
+async def test_sticky_rebind_compare_and_set_rejects_stale_selection(db_setup) -> None:
+    from app.db.models import StickySessionKind
+    from app.modules.proxy.sticky_repository import StickySessionsRepository
+
+    encryptor = TokenEncryptor()
+    async with SessionLocal() as session:
+        repo_accounts = AccountsRepository(session)
+        for account_id in ("acc_cas_a", "acc_cas_b", "acc_cas_c"):
+            await repo_accounts.upsert(
+                Account(
+                    id=account_id,
+                    email=f"{account_id}@example.com",
+                    plan_type="plus",
+                    access_token_encrypted=encryptor.encrypt("access"),
+                    refresh_token_encrypted=encryptor.encrypt("refresh"),
+                    id_token_encrypted=encryptor.encrypt("id"),
+                    last_refresh=utcnow(),
+                    status=AccountStatus.ACTIVE,
+                    deactivation_reason=None,
+                )
+            )
+
+    async with SessionLocal() as session:
+        repo = StickySessionsRepository(session)
+        assert await repo.rebind_if_current(
+            "key_cas",
+            "acc_cas_a",
+            kind=StickySessionKind.CODEX_SESSION,
+            expected_account_id=None,
+        )
+        assert not await repo.rebind_if_current(
+            "key_cas",
+            "acc_cas_b",
+            kind=StickySessionKind.CODEX_SESSION,
+            expected_account_id=None,
+        )
+        assert await repo.rebind_if_current(
+            "key_cas",
+            "acc_cas_b",
+            kind=StickySessionKind.CODEX_SESSION,
+            expected_account_id="acc_cas_a",
+        )
+        assert not await repo.rebind_if_current(
+            "key_cas",
+            "acc_cas_c",
+            kind=StickySessionKind.CODEX_SESSION,
+            expected_account_id="acc_cas_a",
+        )
+        assert await repo.get_account_id("key_cas", kind=StickySessionKind.CODEX_SESSION) == "acc_cas_b"
+        assert not await repo.delete_if_current(
+            "key_cas",
+            kind=StickySessionKind.CODEX_SESSION,
+            expected_account_id="acc_cas_a",
+        )
+        assert await repo.get_account_id("key_cas", kind=StickySessionKind.CODEX_SESSION) == "acc_cas_b"
+        assert await repo.delete_if_current(
+            "key_cas",
+            kind=StickySessionKind.CODEX_SESSION,
+            expected_account_id="acc_cas_b",
+        )
+        assert await repo.get_account_id("key_cas", kind=StickySessionKind.CODEX_SESSION) is None

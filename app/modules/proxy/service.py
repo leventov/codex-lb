@@ -706,6 +706,7 @@ from app.modules.proxy._service.websocket.helpers import (
 )
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
+    _cap_rebind,
     _sticky_key_for_codex_control_request,
     _sticky_key_from_session_header,  # noqa: F401
 )
@@ -1020,7 +1021,7 @@ class ProxyService(
                 request_id=request_id,
                 kind=request_kind,
                 api_key=api_key,
-                sticky_key=affinity.key,
+                sticky_key=affinity.selection_key,
                 sticky_kind=affinity.kind,
                 reallocate_sticky=affinity.reallocate_sticky,
                 sticky_max_age_seconds=affinity.max_age_seconds,
@@ -1094,7 +1095,7 @@ class ProxyService(
                     request_id=request_id,
                     kind=request_kind,
                     api_key=api_key,
-                    sticky_key=affinity.key,
+                    sticky_key=affinity.selection_key,
                     sticky_kind=affinity.kind,
                     reallocate_sticky=affinity.reallocate_sticky,
                     sticky_max_age_seconds=affinity.max_age_seconds,
@@ -1184,7 +1185,7 @@ class ProxyService(
                                     request_id=request_id,
                                     kind=request_kind,
                                     api_key=api_key,
-                                    sticky_key=affinity.key,
+                                    sticky_key=affinity.selection_key,
                                     sticky_kind=affinity.kind,
                                     reallocate_sticky=affinity.reallocate_sticky,
                                     sticky_max_age_seconds=affinity.max_age_seconds,
@@ -1437,7 +1438,7 @@ class ProxyService(
                 return None
             scoped_account_ids = {selected_account_id}
         selection = await self._load_balancer.select_account(
-            sticky_key=affinity.key,
+            sticky_key=affinity.selection_key,
             sticky_kind=affinity.kind,
             reallocate_sticky=affinity.reallocate_sticky,
             sticky_max_age_seconds=affinity.max_age_seconds,
@@ -1692,6 +1693,7 @@ class ProxyService(
         sticky_key: str | None = None,
         sticky_kind: StickySessionKind | None = None,
         reallocate_sticky: bool = False,
+        reallocate_sticky_on_account_cap: bool = False,
         sticky_max_age_seconds: int | None = None,
         prefer_earlier_reset_accounts: bool = False,
         prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
@@ -1702,6 +1704,7 @@ class ProxyService(
         exclude_account_ids: Collection[str] | None = None,
         preferred_account_id: str | None = None,
         require_security_work_authorized: bool = False,
+        require_unambiguous_account: bool = False,
         lease_kind: Literal["response_create", "stream"] | None = None,
         estimated_lease_tokens: float = 0.0,
         fallback_on_preferred_account_unavailable: bool = True,
@@ -1759,10 +1762,8 @@ class ProxyService(
                     if lease_kind == "stream" and request_stage != "reattach"
                     else 0
                 )
-                required_preferred_account = (
-                    preferred_account_id is not None and not fallback_on_preferred_account_unavailable
-                )
-                if _routing_strategy(settings) == "single_account" and not required_preferred_account:
+                preferred_required = preferred_account_id is not None and not fallback_on_preferred_account_unavailable
+                if _routing_strategy(settings) == "single_account" and not preferred_required:
                     selected_account_id = (settings.single_account_id or "").strip()
                     if not selected_account_id:
                         return AccountSelection(
@@ -1789,6 +1790,7 @@ class ProxyService(
                     and preferred_account_id not in excluded_account_ids_set
                     and (scoped_account_ids is None or preferred_account_id in scoped_account_ids)
                 )
+                cap_reallocation = _cap_rebind(reallocate_sticky_on_account_cap, preferred_account_id, request_stage)
                 if preferred_account_id is not None and not preferred_eligible:
                     logger.warning(
                         "Proxy preferred account skipped request_id=%s kind=%s request_stage=%s "
@@ -1811,6 +1813,7 @@ class ProxyService(
                         sticky_key=sticky_key,
                         sticky_kind=sticky_kind,
                         reallocate_sticky=reallocate_sticky,
+                        reallocate_sticky_on_account_cap=False,
                         sticky_max_age_seconds=sticky_max_age_seconds,
                         prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
                         prefer_earlier_reset_window=prefer_earlier_reset_window,
@@ -1855,6 +1858,7 @@ class ProxyService(
                     sticky_key=sticky_key,
                     sticky_kind=sticky_kind,
                     reallocate_sticky=reallocate_sticky,
+                    reallocate_sticky_on_account_cap=cap_reallocation,
                     sticky_max_age_seconds=sticky_max_age_seconds,
                     prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
@@ -1867,6 +1871,7 @@ class ProxyService(
                     account_ids=scoped_account_ids,
                     exclude_account_ids=excluded_account_ids_set,
                     require_security_work_authorized=require_security_work_authorized,
+                    require_unambiguous_account=require_unambiguous_account,
                     budget_threshold_pct=_sticky_reallocation_primary_budget_threshold_pct(settings),
                     secondary_budget_threshold_pct=_sticky_reallocation_secondary_budget_threshold_pct(settings),
                     lease_kind=lease_kind,

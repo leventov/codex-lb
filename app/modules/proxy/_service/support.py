@@ -30,7 +30,7 @@ from app.modules.api_keys.service import (
     ApiKeyUsageReservationData,
 )
 from app.modules.proxy.affinity import _AffinityPolicy
-from app.modules.proxy.load_balancer import AccountLease, AccountSelection
+from app.modules.proxy.load_balancer import AccountLease, AccountSelection, StickyRebind
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
@@ -578,6 +578,10 @@ class _WebSocketRequestState:
     fresh_upstream_request_responses_lite_model: str | None = None
     request_stage: str = "first_turn"
     preferred_account_id: str | None = None
+    # A successful pre-send capacity reroute becomes account-bound once its
+    # response.create frame is handed off; later socket recovery must not
+    # reinterpret the one-shot mobility stage as permission to move again.
+    replay_requires_preferred_account: bool = False
     require_security_work_authorized: bool = False
     file_required_preferred_account: bool = False
     bridge_soft_capacity_reroute_allowed: bool = False
@@ -594,6 +598,7 @@ class _WebSocketRequestState:
     account_response_create_lease: AccountLease | None = None
     account_response_create_release: Callable[[AccountLease | None], Coroutine[Any, Any, None]] | None = None
     websocket_stream_lease: AccountLease | None = None
+    sticky_rebind: StickyRebind | None = None
     affinity_policy: _AffinityPolicy = field(default_factory=_AffinityPolicy)
     suppressed_downstream_tool_call: bool = False
     suppressed_duplicate_tool_call: bool = False
@@ -685,6 +690,15 @@ class _HTTPBridgeSession:
     last_upstream_close_code: int | None = None
     closed: bool = False
     account_lease: AccountLease | None = None
+    sticky_rebind: StickyRebind | None = None
+    # A cap-selected replacement owns an upstream process but not the canonical
+    # bridge identity yet. These fields keep it invisible until the submitting
+    # request crosses every admission gate and commits the sticky-owner CAS.
+    pending_publish_key: _HTTPBridgeSessionKey | None = None
+    pending_creation_key: _HTTPBridgeSessionKey | None = None
+    pending_creation_future: asyncio.Future[_HTTPBridgeSession] | None = None
+    pending_durable_allow_takeover: bool = False
+    pending_durable_force_owner_epoch_advance: bool = False
     upstream_close_attempted: bool = False
     seen_tool_call_keys: dict[ToolCallDedupeKey, None] = field(default_factory=dict)
     upstream_proxy_route_mode: str | None = None
